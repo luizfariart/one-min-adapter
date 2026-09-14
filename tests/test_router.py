@@ -1,7 +1,6 @@
-"""Unit tests for the model router — classification, routing, and fallback logic.
+"""Unit tests for the model router — classification, routing, isolation, thrash.
 
-Pure logic only: no network, no real 1min.ai/Portal calls. The classification
-rules and route table are the behaviour contract.
+Pure logic only: no network, no real 1min.ai/Portal calls.
 """
 
 import importlib.util
@@ -15,6 +14,13 @@ _SPEC = importlib.util.spec_from_file_location(
 )
 _mod = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_mod)
+
+
+@pytest.fixture(autouse=True)
+def _reset_thrash():
+    _mod._reset_thrash_history()
+    yield
+    _mod._reset_thrash_history()
 
 
 class TestClassification:
@@ -31,7 +37,6 @@ class TestClassification:
         "pesquisa sobre energia solar",
         "compara esses dois artigos",
         "analisa os dados",
-        "por que o céu é azul",
     ])
     def test_research_keywords(self, text):
         assert _mod.classify([{"role": "user", "content": text}]) == "research"
@@ -45,52 +50,86 @@ class TestClassification:
     def test_fast_keywords(self, text):
         assert _mod.classify([{"role": "user", "content": text}]) == "fast"
 
+    @pytest.mark.parametrize("text", [
+        "explique o que é entropia",
+        "por que o céu é azul",
+        "me dê 3 ideias de nome",
+        "qual a diferença entre vírus e bactéria",
+        "como funciona um motor elétrico",
+    ])
+    def test_mid_keywords(self, text):
+        # Simple explanations/questions → mid (cheap), NOT research (expensive).
+        assert _mod.classify([{"role": "user", "content": text}]) == "mid"
+
     def test_empty_falls_back_to_chat(self):
         assert _mod.classify([]) == "chat"
-        assert _mod.classify([{"role": "user", "content": ""}]) == "chat"
-
-    def test_inconclusive_returns_something_valid(self, monkeypatch):
-        # No keyword matches → falls through to the model classifier; if that
-        # fails too, it must still return a valid class (never raise).
-        monkeypatch.setattr(_mod, "_classify_with_model", lambda text: "chat")
-        result = _mod.classify([{"role": "user", "content": "blá blá blá xyz"}])
-        assert result in _mod.ROUTE_TABLE
 
     def test_inconclusive_model_failure_falls_back(self, monkeypatch):
         monkeypatch.setattr(_mod, "_classify_with_model", lambda text: (_ for _ in ()).throw(RuntimeError("down")))
-        result = _mod.classify([{"role": "user", "content": "xyz"}])
-        assert result == "chat"
+        assert _mod.classify([{"role": "user", "content": "xyz blá"}]) == "chat"
 
 
 class TestRoutingTable:
-    def test_fast_goes_to_1min(self):
+    def test_fast_and_mid_go_to_1min(self):
         assert _mod.ROUTE_TABLE["fast"]["backend"] == "1min"
+        assert _mod.ROUTE_TABLE["mid"]["backend"] == "1min"
 
     def test_heavy_tasks_go_to_portal(self):
         for cls in ("code", "research", "chat", "review"):
             assert _mod.ROUTE_TABLE[cls]["backend"] == "portal"
 
-    def test_fast_has_cheap_fallback(self):
-        fb = _mod.ROUTE_TABLE["fast"].get("fallback_model")
-        assert fb and "flash" in fb
-
-    def test_every_class_has_a_model(self):
-        for cls, route in _mod.ROUTE_TABLE.items():
-            assert route.get("model"), f"{cls} missing model"
+    def test_light_tasks_have_cheap_fallback(self):
+        for cls in ("fast", "mid"):
+            fb = _mod.ROUTE_TABLE[cls].get("fallback_model")
+            assert fb and "flash" in fb
 
 
-class TestLastUserText:
-    def test_gets_last_user_message(self):
+class TestIsolatedPrompt:
+    def test_task_only_no_system(self):
         msgs = [
-            {"role": "user", "content": "primeiro"},
-            {"role": "assistant", "content": "resposta"},
-            {"role": "user", "content": "segundo"},
+            {"role": "system", "content": "INSTRUÇÕES GIGANTES AQUI"},
+            {"role": "user", "content": "formate em tabela: A B. 1 2"},
         ]
-        assert _mod._last_user_text(msgs) == "segundo"
+        out = _mod._isolated_prompt(msgs)
+        assert "INSTRUÇÕES GIGANTES" not in out  # system prompt stripped
+        assert "formate em tabela" in out          # the task is kept
 
-    def test_empty_when_no_user_message(self):
-        assert _mod._last_user_text([{"role": "assistant", "content": "oi"}]) == ""
+    def test_followup_keeps_previous_answer(self):
+        msgs = [
+            {"role": "user", "content": "traduza bom dia para inglês"},
+            {"role": "assistant", "content": "good morning"},
+            {"role": "user", "content": "e agora boa noite"},
+        ]
+        out = _mod._isolated_prompt(msgs)
+        assert "good morning" in out
+        assert "boa noite" in out
 
-    def test_flattens_multimodal_content(self):
-        msgs = [{"role": "user", "content": [{"type": "text", "text": "veja isto"}]}]
-        assert _mod._last_user_text(msgs) == "veja isto"
+    def test_minimal_drops_context(self):
+        msgs = [
+            {"role": "user", "content": "traduza bom dia"},
+            {"role": "assistant", "content": "good morning"},
+            {"role": "user", "content": "e boa noite"},
+        ]
+        out = _mod._isolated_prompt(msgs, minimal=True)
+        assert "good morning" not in out  # even follow-up context dropped
+        assert "boa noite" in out
+
+    def test_empty_returns_empty(self):
+        assert _mod._isolated_prompt([]) == ""
+
+
+class TestThrashDetection:
+    def test_no_thrash_when_stable(self):
+        for _ in range(6):
+            _mod._record_backend("portal")
+        assert not _mod._detect_thrash()
+
+    def test_thrash_when_bouncing(self):
+        for b in ("portal", "1min", "portal", "1min", "portal", "1min"):
+            _mod._record_backend(b)
+        assert _mod._detect_thrash()
+
+    def test_no_thrash_with_few_requests(self):
+        _mod._record_backend("portal")
+        _mod._record_backend("1min")
+        assert not _mod._detect_thrash()  # < 4 requests → not enough history

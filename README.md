@@ -78,11 +78,31 @@ Edit `ROUTE_TABLE` in `model_router.py` to change which task class goes where:
 
 | Class | Backend | Model |
 |---|---|---|
-| `fast` | 1min.ai | `deepseek-flash` (fallback: Portal `deepseek-v4-flash`) |
+| `fast` | 1min.ai | `deepseek-flash` (isolated prompt; fallback: Portal `deepseek-v4-flash`) |
+| `mid` | 1min.ai | `deepseek-chat` (isolated prompt; fallback: Portal `deepseek-v4-flash`) |
 | `code` | Portal | `deepseek/deepseek-v4-pro` |
 | `research` | Portal | `anthropic/claude-opus-5` |
 | `chat` | Portal | `openai/gpt-5.4` |
 | `review` | Portal | `kwaipilot/kat-coder-pro-v2.5` |
+
+## Cost isolation
+
+Lightweight tasks (`fast`/`mid`) are sent to 1min.ai with an **isolated
+prompt** — only the task, never the agent's large system prompt or history. A
+formatting or explanation task does not need the agent's persona instructions,
+so those credits stay unspent. This is the "open the light task in a fresh
+chat" optimization.
+
+Short follow-ups (≤15 words) keep the previous assistant reply as context so
+"and in English?" still refers to something.
+
+## Thrash detection
+
+The router keeps a rolling history of the backend used per request. When the
+conversation bounces between Portal and 1min.ai frequently (≥50% switches in the
+last 8 requests), lightweight tasks switch to **minimal** isolation — dropping
+even the follow-up context — so the credit spend stays at its floor while heavy
+turns keep their cached Portal prefix.
 
 ## Development
 

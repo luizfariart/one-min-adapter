@@ -7,16 +7,21 @@ every `/v1/chat/completions` request it:
    first, then a free/cheap model — 1min.ai deepseek-flash — only when the
    rules are inconclusive).
 2. **Routes** the request to the right backend:
-   - ``fast`` / trivial → 1min.ai directly (pre-paid credit balance, no Portal spend)
+   - ``fast`` / ``mid`` → 1min.ai directly (pre-paid credit balance), with an
+     **isolated prompt** — only the task is sent, not the huge system prompt or
+     history, so the credit spend is minimal ("a fresh chat" per task).
    - ``code`` / ``research`` / ``chat`` / ``review`` → the Hermes portal proxy
      (``http://127.0.0.1:8645/v1``), which attaches the Nous OAuth credentials.
 3. **Falls back** cleanly: if the primary backend fails (credits exhausted,
    rate limit, timeout), it routes to the other backend. It never hangs and
    never returns a half-formed 200.
 
-This replaces the manual ``/model <alias>`` switching: routing happens in the
-proxy on every request, independent of whether the agent's own model remembers
-to re-classify.
+**Thrash detection:** the router keeps a rolling history of the backend used
+per request. When the conversation is bouncing between Portal and 1min.ai
+frequently (which would otherwise re-send the big Portal prompt on every heavy
+turn), the router switches lightweight tasks to *minimal* isolation — dropping
+even the follow-up context — to keep spend at the absolute minimum while the
+heavy turns keep their cached Portal prefix.
 """
 
 from __future__ import annotations
@@ -43,9 +48,10 @@ PORTAL_PROXY_URL = os.environ.get("PORTAL_PROXY_URL", "http://127.0.0.1:8645/v1"
 REQUEST_TIMEOUT = 300
 
 # Task classes and their target backend + model.
-# "fast" goes to 1min.ai (credit balance); the rest go to the Portal.
+# "fast" and "mid" go to 1min.ai (credit balance); the rest go to the Portal.
 ROUTE_TABLE: dict[str, dict] = {
-    "fast":     {"backend": "1min",  "model": "deepseek-flash",        "fallback_model": "deepseek/deepseek-v4-flash"},
+    "fast":     {"backend": "1min",   "model": "deepseek-flash", "fallback_model": "deepseek/deepseek-v4-flash"},
+    "mid":      {"backend": "1min",   "model": "deepseek-chat",  "fallback_model": "deepseek/deepseek-v4-flash"},
     "code":     {"backend": "portal", "model": "deepseek/deepseek-v4-pro"},
     "research": {"backend": "portal", "model": "anthropic/claude-opus-5"},
     "chat":     {"backend": "portal", "model": "openai/gpt-5.4"},
@@ -54,6 +60,8 @@ ROUTE_TABLE: dict[str, dict] = {
 
 # Keyword rules → task class. Order matters (first match wins).
 # Deterministic and free — most requests never touch the classifier model.
+# "mid" comes before "research" so simple explanations (which used to go to the
+# expensive claude-opus) now land on the cheap 1min backend instead.
 _KEYWORD_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("code", (
         "code", "codigo", "código", "debug", "debugar", "script", "função", "funcao",
@@ -61,14 +69,22 @@ _KEYWORD_RULES: list[tuple[str, tuple[str, ...]]] = [
         "implementar", "implement", "programa", "programar", "python", "typescript",
         "javascript", "sql", "regex", "compilar", "build", "commit", "git",
     )),
-    ("research", (
-        "pesquis", "research", "analis", "compare", "compar", "sintetiz", "fonte",
-        "referência", "referencia", "estud", "artigo", "paper", "academic", "busca",
-        "search", "explique", "explic", "por que", "porque", "como funciona",
-    )),
     ("review", (
         "review", "revisar", "revisão", "revisao", "auditar", "audit", "validar",
         "validate", "code review", "inspecionar", "inspect",
+    )),
+    ("mid", (
+        "explique", "explic", "o que é", "o que sao", "o que são", "o que e",
+        "por que", "porque", "como funciona", "como faço", "como faco", "como fazer",
+        "qual a diferença", "qual a diferenca", "diferença entre", "diferenca entre",
+        "ideias", "ideia", "dicas", "exemplos", "exemplo", "sugest",
+        "me dê", "me de", "me diga", "me diga", "escreva um texto", "elabore",
+        "o que significa", "o que quer dizer",
+    )),
+    ("research", (
+        "pesquis", "research", "analis", "compare", "compar", "sintetiz",
+        "fonte", "referência", "referencia", "estud", "artigo", "paper", "academic",
+        "busca", "search", "levantamento", "deep research",
     )),
     ("fast", (
         "formata", "formatar", "formate", "tabela", "lista",
@@ -77,6 +93,40 @@ _KEYWORD_RULES: list[tuple[str, tuple[str, ...]]] = [
     )),
 ]
 
+
+# --------------------------------------------------------------------------- #
+# Thrash detection — rolling history of backend per request
+# --------------------------------------------------------------------------- #
+
+_RECENT_BACKENDS: list[str] = []
+_MAX_HISTORY = 8
+# A "switch" is a backend change between two consecutive requests. When switches
+# dominate the recent window, the conversation is thrashing between Portal and
+# 1min.ai and we isolate lightweight tasks harder to protect the Portal cache.
+_THRASH_SWITCH_RATIO = 0.5
+
+
+def _record_backend(backend: str) -> None:
+    _RECENT_BACKENDS.append(backend)
+    if len(_RECENT_BACKENDS) > _MAX_HISTORY:
+        _RECENT_BACKENDS.pop(0)
+
+
+def _detect_thrash() -> bool:
+    """True when the recent request history is bouncing between backends."""
+    if len(_RECENT_BACKENDS) < 4:
+        return False
+    switches = sum(1 for a, b in zip(_RECENT_BACKENDS, _RECENT_BACKENDS[1:]) if a != b)
+    return switches >= int(len(_RECENT_BACKENDS) * _THRASH_SWITCH_RATIO)
+
+
+def _reset_thrash_history() -> None:
+    _RECENT_BACKENDS.clear()
+
+
+# --------------------------------------------------------------------------- #
+# Key + message helpers
+# --------------------------------------------------------------------------- #
 
 def _api_key() -> str:
     env = os.environ.get("ONEMIN_API_KEY", "")
@@ -98,9 +148,14 @@ def _last_user_text(messages: list[dict]) -> str:
             c = m.get("content") or ""
             if isinstance(c, str):
                 return c
-            # content as list of parts (multimodal) — flatten text
             return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
     return ""
+
+
+def _looks_portuguese(text: str) -> bool:
+    """Cheap heuristic so isolated prompts keep the user's language."""
+    pt_markers = ("ç", "ã", "õ", "é", "á", "í", "ó", "ú", "ê", "ô", "à", " para ", " como ", " que ", " um ", " uma ")
+    return any(m in text for m in pt_markers)
 
 
 def classify(messages: list[dict]) -> str:
@@ -110,16 +165,16 @@ def classify(messages: list[dict]) -> str:
     if not text:
         return "chat"
 
-    # Deterministic keyword pass (free, instant).
     for cls, kws in _KEYWORD_RULES:
         if any(kw in text for kw in kws):
             return cls
 
-    # Inconclusive → ask the cheap model.
     try:
         return _classify_with_model(text)
     except Exception:
         return "chat"
+
+
 def _classify_with_model(text: str) -> str:
     """Free/cheap classification via 1min.ai deepseek-flash."""
     key = _api_key()
@@ -127,7 +182,7 @@ def _classify_with_model(text: str) -> str:
         return "chat"
     prompt = (
         "Classify this task into exactly one category: code, research, chat, "
-        "review, or fast. Reply with only that single word.\n\n"
+        "review, mid, or fast. Reply with only that single word.\n\n"
         f"Task: {text[:500]}"
     )
     payload = {
@@ -153,20 +208,11 @@ def _classify_with_model(text: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 1min.ai backend (existing adapter logic, kept local to the router)
+# Prompt builders — full (Portal) vs isolated (1min lightweight)
 # --------------------------------------------------------------------------- #
 
-_ONEMIN_MODEL_MAP = {
-    "deepseek-flash": "deepseek-flash",
-    "deepseek-v4-flash": "deepseek-flash",
-    "deepseek-chat": "deepseek-chat",
-    "deepseek-v4-pro": "deepseek-v4-pro",
-    "gpt-5.4-mini": "gpt-5.4-mini",
-    "gpt-4o-mini": "gpt-4o-mini",
-}
-
-
 def _build_prompt(messages: list[dict]) -> str:
+    """Full prompt (system + history) — used for Portal forwarding context."""
     system = []
     parts = []
     for m in messages or []:
@@ -185,18 +231,61 @@ def _build_prompt(messages: list[dict]) -> str:
     return "\n\n".join(out)
 
 
+def _isolated_prompt(messages: list[dict], *, minimal: bool = False) -> str:
+    """Prompt for lightweight (fast/mid) tasks — the task alone, without the
+    huge system prompt or full history. This is the "fresh chat" optimization:
+    a formatting/explanation task does not need the agent's system prompt.
+
+    When ``minimal`` is False, a short follow-up (≤15 words) gets the previous
+    assistant reply as context so "and in English?" still refers to something.
+    When ``minimal`` is True (thrash mode), even that context is dropped to
+    keep every credit.
+    """
+    last = _last_user_text(messages)
+    if not last:
+        return ""
+
+    # Language guard: isolated prompts skip the system prompt that normally
+    # forces Portuguese, so re-assert it here when the task is in Portuguese.
+    lang = "Respond in the same language as the task.\n\n" if _looks_portuguese(last) else ""
+
+    if not minimal and len(last.split()) <= 15:
+        for m in reversed(messages or []):
+            if m.get("role") == "assistant":
+                prev = (m.get("content") or "").strip()
+                if prev:
+                    return f"{lang}Context (previous answer):\n{prev[:1000]}\n\nNew task:\n{last}"
+                break
+    return f"{lang}{last}"
+
+
+# --------------------------------------------------------------------------- #
+# Backends
+# --------------------------------------------------------------------------- #
+
+_ONEMIN_MODEL_MAP = {
+    "deepseek-flash": "deepseek-flash",
+    "deepseek-v4-flash": "deepseek-flash",
+    "deepseek-chat": "deepseek-chat",
+    "deepseek-v4-pro": "deepseek-v4-pro",
+    "gpt-5.4-mini": "gpt-5.4-mini",
+    "gpt-4o-mini": "gpt-4o-mini",
+}
+
+
 def _openai_error(status: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(status_code=status, content={"error": {"type": code, "message": message}})
 
 
-def _call_1min(messages: list[dict], model: str) -> dict:
+def _call_1min(prompt: str, model: str) -> dict:
+    """Call 1min.ai with an already-built prompt string."""
     key = _api_key()
     if not key:
         raise ValueError("1min.ai API key not configured")
     payload = {
         "type": "UNIFY_CHAT_WITH_AI",
         "model": _ONEMIN_MODEL_MAP.get(model, model),
-        "promptObject": {"prompt": _build_prompt(messages), "settings": {"webSearchSettings": {"webSearch": False}}},
+        "promptObject": {"prompt": prompt, "settings": {"webSearchSettings": {"webSearch": False}}},
     }
     with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
         resp = client.post(
@@ -213,16 +302,6 @@ def _call_1min(messages: list[dict], model: str) -> dict:
     if record.get("status") == "FAILED":
         raise RuntimeError("1min.ai request FAILED")
     return record
-
-
-def _call_portal(messages: list[dict], model: str, stream: bool):
-    """Forward to the Hermes portal proxy (attaches Nous OAuth)."""
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": stream,
-    }
-    return httpx.Client(timeout=REQUEST_TIMEOUT, headers={"Authorization": "Bearer hermes-router"})
 
 
 def _extract_text(record: dict) -> str:
@@ -246,6 +325,7 @@ def health():
         "ok": True,
         "1min_key_configured": bool(_api_key()),
         "portal_proxy": PORTAL_PROXY_URL,
+        "thrash": _detect_thrash(),
     }
 
 
@@ -267,30 +347,34 @@ async def chat_completions(request: Request):
     stream = bool(body.get("stream", False))
     task = classify(messages)
     route = ROUTE_TABLE.get(task, ROUTE_TABLE["chat"])
-    log.info("routing -> %s (backend=%s)", task, route["backend"])
+    thrash = _detect_thrash()
+    log.info("routing -> %s (backend=%s, thrash=%s)", task, route["backend"], thrash)
 
-    # Fast → 1min.ai directly. ANY 1min failure (missing key, 401, 429, credits
-    # exhausted, network) falls back to the Portal proxy so the request never
-    # dies just because the credit backend is down.
+    # Lightweight (fast/mid) → 1min.ai with an ISOLATED prompt (task only, no
+    # system prompt/history) so the credit spend stays minimal. In thrash mode
+    # even the follow-up context is dropped. ANY failure falls back to Portal.
     if route["backend"] == "1min":
+        prompt = _isolated_prompt(messages, minimal=thrash)
         try:
-            record = _call_1min(messages, route["model"])
+            record = _call_1min(prompt, route["model"])
         except Exception as exc:
             log.warning("1min backend failed (%s) — falling back to portal", exc)
-            # Fall back to the cheap Portal flash model, not the expensive one.
             route = {"backend": "portal", "model": route.get("fallback_model") or "deepseek/deepseek-v4-flash"}
-        else:
-            text = _extract_text(record)
-            return {
-                "id": "chatcmpl-1min",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": route["model"],
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            }
+            _record_backend("portal")
+            return await _forward_portal(messages, route["model"], stream)
+        _record_backend("1min")
+        text = _extract_text(record)
+        return {
+            "id": "chatcmpl-1min",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": route["model"],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
 
-    # Portal (or 1min fallback landed here) → forward to the portal proxy.
+    # Heavy → Portal (full context, cached prefix).
+    _record_backend("portal")
     return await _forward_portal(messages, route["model"], stream)
 
 

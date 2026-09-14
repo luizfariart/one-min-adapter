@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-09-14
+
+### Added
+
+- `mid` task class — simple explanations/questions now route to the cheap
+  1min.ai backend (deepseek-chat) instead of the expensive Portal claude-opus.
+- **Cost isolation** — `fast`/`mid` tasks are sent with an isolated prompt
+  (task only, no system prompt/history), the "fresh chat" optimization.
+- **Thrash detection** — rolling backend history; when the conversation bounces
+  between Portal and 1min.ai, lightweight tasks switch to minimal isolation to
+  protect the Portal cache and keep credit spend at its floor.
+
 ## [1.1.0] - 2026-09-14
 
 ### Added
