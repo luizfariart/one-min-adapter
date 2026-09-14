@@ -250,3 +250,95 @@ def improve(
         result[cls] = [t for t, _ in scored[:max_per_class]]
 
     return result
+
+
+def should_run(state_path: Path, interval_seconds: int) -> bool:
+    """True when the job has not run within ``interval_seconds``.
+
+    Lets a launchd job be registered with RunAtLoad + StartCalendarInterval and
+    still be idempotent: it fires whenever the Mac wakes/logs in, but only does
+    work if the interval elapsed since the last recorded run. This is the
+    "run as soon as possible if the machine was off at the scheduled time"
+    guarantee.
+    """
+    try:
+        if state_path.exists():
+            last = float(state_path.read_text(encoding="utf-8").strip())
+            return (time.time() - last) >= interval_seconds
+    except Exception:
+        pass
+    return True
+
+
+def mark_run(state_path: Path) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(str(time.time()), encoding="utf-8")
+
+
+# Weekly paid audit — re-judge learned exemplars to break self-reinforcement.
+#
+# The daily loop can self-reinforce: if the vector index ever mislabels a task
+# (say, routes "format X" to the Portal as an "action"), that wrong decision is
+# logged and then *promoted back into the index* by the next daily job — the
+# error feeds itself. A paid model, run weekly on the Portal, acts as an
+# independent judge: it re-classifies every exemplar and any disagreement
+# corrects the index. Rare (weekly) and high-judgment, which is exactly what a
+# paid model is for.
+
+def build_audit_prompt(exemplars: dict[str, list[str]]) -> str:
+    """Prompt asking the audit model to re-classify every exemplar into exactly
+    one of the two classes, returned as a JSON object."""
+    tasks: list[str] = []
+    for cls in ("action", "text"):
+        tasks.extend(exemplars.get(cls, []))
+    numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(tasks))
+    return (
+        "You are auditing a two-class task classifier. Classify each task below "
+        "into exactly one of:\n"
+        '- "action": requires an external tool (web search, file read/write, '
+        "running a command, sending email, calendar, real-time data).\n"
+        '- "text": pure text work (format, translate, summarize, explain, list, '
+        "correct grammar).\n\n"
+        "Reply with ONLY a JSON object with two keys, \"action\" and \"text\", "
+        "each an array of the task strings you place in that class. Include "
+        "every task exactly once, verbatim.\n\n"
+        f"Tasks:\n{numbered}"
+    )
+
+
+def parse_audit_response(text: str, exemplars: dict[str, list[str]]) -> tuple[dict[str, list[str]], list[tuple[str, str, str]]]:
+    """Parse the audit model's JSON reply and apply its reclassification.
+
+    Returns (corrected_exemplars, changes) where changes is a list of
+    (task, from_class, to_class) for every exemplar the model moved. A
+    malformed reply leaves the index unchanged (empty changes).
+    """
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return {k: list(v) for k, v in exemplars.items()}, []
+    try:
+        data = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return {k: list(v) for k, v in exemplars.items()}, []
+
+    action_set = {_normalize(x) for x in data.get("action", []) if isinstance(x, str)}
+    text_set = {_normalize(x) for x in data.get("text", []) if isinstance(x, str)}
+    if not action_set and not text_set:
+        return {k: list(v) for k, v in exemplars.items()}, []
+
+    corrected: dict[str, list[str]] = {"action": [], "text": []}
+    changes: list[tuple[str, str, str]] = []
+    for cls in ("action", "text"):
+        for ex in exemplars.get(cls, []):
+            n = _normalize(ex)
+            if n in action_set:
+                target = "action"
+            elif n in text_set:
+                target = "text"
+            else:
+                target = cls  # model omitted it → keep as-is
+            corrected[target].append(ex)
+            if target != cls:
+                changes.append((ex, cls, target))
+    return corrected, changes

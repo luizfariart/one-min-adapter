@@ -25,8 +25,16 @@ from exemplars import (  # noqa: E402
     WINDOW_DAYS,
     load_exemplars,
     improve,
+    mark_run,
     save_exemplars,
+    should_run,
 )
+
+# Run-at-most-once guard: launchd fires this on login/wake AND at the calendar
+# time; this makes it idempotent — "run as soon as possible if the Mac was off
+# at 04:30" without double-running.
+_STATE_PATH = Path.home() / ".hermes" / "one-min-adapter" / ".last_improve"
+_INTERVAL = 24 * 3600
 
 
 def load_usage(path: Path = USAGE_LOG_PATH) -> list[dict]:
@@ -53,7 +61,12 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="print changes, do not write")
     ap.add_argument("--usage", type=Path, default=USAGE_LOG_PATH)
     ap.add_argument("--exemplars", type=Path, default=EXEMPLARS_PATH)
+    ap.add_argument("--force", action="store_true", help="ignore the 24h interval")
     args = ap.parse_args()
+
+    if not args.force and not should_run(_STATE_PATH, _INTERVAL):
+        print("self-improve: skipped (ran within the last 24h)")
+        return 0
 
     usage = load_usage(args.usage)
     before = load_exemplars(args.exemplars)
@@ -74,6 +87,7 @@ def main() -> int:
         return 0
 
     save_exemplars(after, args.exemplars)
+    mark_run(_STATE_PATH)
     return 0
 
 

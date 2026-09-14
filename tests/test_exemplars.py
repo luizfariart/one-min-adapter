@@ -152,3 +152,61 @@ class TestLoadSave:
         p.write_text("{ not json", encoding="utf-8")
         got = _ex.load_exemplars(p)
         assert got["action"] == _ex.DEFAULT_EXEMPLARS["action"]
+
+
+class TestShouldRun:
+    def test_first_run_returns_true(self, tmp_path):
+        assert _ex.should_run(tmp_path / "state", 3600) is True
+
+    def test_within_interval_returns_false(self, tmp_path):
+        p = tmp_path / "state"
+        _ex.mark_run(p)
+        assert _ex.should_run(p, 3600) is False
+
+    def test_after_interval_returns_true(self, tmp_path):
+        p = tmp_path / "state"
+        p.write_text(str(time.time() - 7200), encoding="utf-8")
+        assert _ex.should_run(p, 3600) is True
+
+    def test_mark_run_writes_timestamp(self, tmp_path):
+        p = tmp_path / "state"
+        _ex.mark_run(p)
+        assert p.exists()
+        assert float(p.read_text()) > 0
+
+
+class TestAudit:
+    def test_prompt_contains_all_tasks(self):
+        ex = {"action": ["leia arquivo"], "text": ["formate tabela"]}
+        p = _ex.build_audit_prompt(ex)
+        assert "leia arquivo" in p and "formate tabela" in p
+        assert '"action"' in p and '"text"' in p
+
+    def test_parse_applies_reclassification(self):
+        ex = {"action": ["formate em tabela"], "text": ["leia arquivo"]}  # swapped on purpose
+        reply = '{"action": ["leia arquivo"], "text": ["formate em tabela"]}'
+        after, changes = _ex.parse_audit_response(reply, ex)
+        assert after["action"] == ["leia arquivo"]
+        assert after["text"] == ["formate em tabela"]
+        assert ("formate em tabela", "action", "text") in changes
+        assert ("leia arquivo", "text", "action") in changes
+
+    def test_parse_keeps_agreement_unchanged(self):
+        ex = {"action": ["leia arquivo"], "text": ["formate tabela"]}
+        reply = '{"action": ["leia arquivo"], "text": ["formate tabela"]}'
+        after, changes = _ex.parse_audit_response(reply, ex)
+        assert after == ex
+        assert changes == []
+
+    def test_parse_malformed_leaves_unchanged(self):
+        ex = {"action": ["leia arquivo"], "text": ["formate tabela"]}
+        after, changes = _ex.parse_audit_response("not json at all", ex)
+        assert after == ex and changes == []
+
+    def test_parse_missing_task_kept_as_is(self):
+        # Model omits one exemplar → it stays in its current class.
+        ex = {"action": ["leia arquivo", "abra documento"], "text": []}
+        reply = '{"action": ["leia arquivo"], "text": []}'
+        after, changes = _ex.parse_audit_response(reply, ex)
+        assert "abra documento" in after["action"]  # not dropped
+        assert changes == []

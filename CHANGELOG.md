@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-09-14
+
+### Added
+
+- **Weekly paid audit** (`audit.py`, launchd every Monday 04:45) — a paid
+  Portal model re-judges every exemplar; disagreements correct the index to
+  break the daily loop's self-reinforcement.
+- **Catch-up scheduling** — `RunAtLoad` + `should_run()` interval guard so the
+  daily and weekly jobs run as soon as the Mac is awake if it was off at the
+  scheduled time, without ever double-running.
+
 ## [1.4.0] - 2026-09-14
 
 ### Added

@@ -137,6 +137,23 @@ changes, so learning takes effect without a restart. This is the closed loop:
 every request teaches the index, and the index shapes every future request —
 offline, at zero per-request cost.
 
+## Weekly paid audit (anti self-reinforcement)
+
+The daily loop can self-reinforce: if the vector index ever mislabels a task,
+that wrong decision is logged and *promoted back into the index*, feeding its
+own error. A weekly job (`audit.py`, launchd every Monday 04:45) sends the paid
+Portal model the full exemplar list and asks it to re-judge each one. Any
+disagreement corrects the index. The audit model is an independent judge — a
+rare, high-judgment check that a cheap local vector index cannot do for itself.
+
+## Catch-up scheduling
+
+Both jobs use `RunAtLoad` + `StartCalendarInterval` **and** a `should_run()`
+interval guard: they fire on login/wake and at the scheduled time, but only do
+work if the interval (24h daily, 7d audit) has elapsed since the last run. If
+the Mac was off at 04:30, the job runs as soon as the Mac is next awake, and
+never double-runs.
+
 ## Thrash detection
 
 The router keeps a rolling history of the backend used per request. When the

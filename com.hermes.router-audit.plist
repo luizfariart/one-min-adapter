@@ -3,18 +3,20 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.hermes.router-self-improve</string>
+    <string>com.hermes.router-audit</string>
     <key>ProgramArguments</key>
     <array>
         <string>/Users/luizfaria/.hermes/hermes-agent/venv/bin/python3</string>
-        <string>/Users/luizfaria/repos/one-min-adapter/self_improve.py</string>
+        <string>/Users/luizfaria/repos/one-min-adapter/audit.py</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
         <key>Hour</key>
         <integer>4</integer>
         <key>Minute</key>
-        <integer>30</integer>
+        <integer>45</integer>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -23,8 +25,8 @@
     <key>Nice</key>
     <integer>15</integer>
     <key>StandardOutPath</key>
-    <string>/Users/luizfaria/.hermes/logs/self-improve.log</string>
+    <string>/Users/luizfaria/.hermes/logs/audit.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/luizfaria/.hermes/logs/self-improve.err.log</string>
+    <string>/Users/luizfaria/.hermes/logs/audit.err.log</string>
 </dict>
 </plist>
