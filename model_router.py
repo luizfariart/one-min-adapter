@@ -42,6 +42,7 @@ import logging
 import os
 import time
 from pathlib import Path
+import asyncio
 
 import httpx
 from fastapi import FastAPI, Request
@@ -63,7 +64,7 @@ ONEMIN_API_BASE = "https://api.1min.ai"
 ONEMIN_CHAT_PATH = "/api/chat-with-ai"
 PORTAL_PROXY_URL = os.environ.get("PORTAL_PROXY_URL", "http://127.0.0.1:8645/v1")
 
-REQUEST_TIMEOUT = 300
+REQUEST_TIMEOUT = 15  # per-request cap: 300→60→15s; fallback to Portal kicks in quickly
 
 # Marker the 1min model must emit when the task needs an external tool/action.
 NEED_TOOL = "[[NEED_TOOL]]"
@@ -270,13 +271,16 @@ def _classify_with_model(text: str) -> str:
         "model": "deepseek-flash",
         "promptObject": {"prompt": prompt},
     }
-    with httpx.Client(timeout=60) as client:
-        resp = client.post(
-            f"{ONEMIN_API_BASE}{ONEMIN_CHAT_PATH}",
-            headers={"API-KEY": key, "Content-Type": "application/json"},
-            json=payload,
-        )
-    resp.raise_for_status()
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.post(
+                f"{ONEMIN_API_BASE}{ONEMIN_CHAT_PATH}",
+                headers={"API-KEY": key, "Content-Type": "application/json"},
+                json=payload,
+            )
+        resp.raise_for_status()
+    except Exception:
+        return "chat"
     record = resp.json().get("aiRecord") or {}
     detail = record.get("aiRecordDetail") or {}
     result = detail.get("resultObject") or []
@@ -371,7 +375,10 @@ def _openai_error(status: int, code: str, message: str) -> JSONResponse:
 
 
 def _call_1min(prompt: str, model: str) -> dict:
-    """Call 1min.ai with an already-built prompt string."""
+    """Call 1min.ai with an already-built prompt string.
+
+    Synchronous but called via ``asyncio.to_thread`` from the async handler so
+    it never blocks the uvicorn event loop — critical for concurrent routing."""
     key = _api_key()
     if not key:
         raise ValueError("1min.ai API key not configured")
@@ -447,7 +454,8 @@ async def chat_completions(request: Request):
     messages = body.get("messages") or []
     stream = bool(body.get("stream", False))
     user_text = _last_user_text(messages)
-    task = classify(messages)
+    # classify() may call the network; run it in a thread so the event loop stays unblocked
+    task = await asyncio.to_thread(classify, messages)
     thrash = _detect_thrash()
     log.info("routing -> %s (thrash=%s, stream=%s)", task, thrash, stream)
 
@@ -468,7 +476,9 @@ async def chat_completions(request: Request):
     if route["backend"] == "1min":
         prompt = _isolated_prompt(messages, minimal=thrash)
         try:
-            record = _call_1min(prompt, route["model"])
+            # _call_1min is synchronous (httpx.Client) — run in a thread so it
+            # never blocks the async event loop, even under network timeouts.
+            record = await asyncio.to_thread(_call_1min, prompt, route["model"])
         except Exception as exc:
             log.warning("1min backend failed (%s) — falling back to portal", exc)
             _record_backend("portal")
