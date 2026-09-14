@@ -39,17 +39,22 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
-import re
 import time
-from collections import Counter
 from pathlib import Path
-from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+
+from exemplars import (  # noqa: E402
+    USAGE_LOG_PATH,
+    build_centroids,
+    load_exemplars,
+    _normalize,
+    _vec,
+    _cosine,
+)
 
 log = logging.getLogger("model_router")
 
@@ -117,109 +122,56 @@ _KEYWORD_RULES: list[tuple[str, tuple[str, ...]]] = [
 # Vector index — TF-IDF + cosine similarity to detect "action" vs "text" tasks
 # --------------------------------------------------------------------------- #
 #
-# A deterministic, dependency-free "euclidean index": each task is tokenized
-# into a TF-IDF vector, then compared (cosine) against the centroids of two
-# reference classes. "action" = needs a tool (web/file/command/email/calendar/
-# real-time data); "text" = pure text work (format, translate, explain, list).
-# This runs BEFORE the cheap 1min call, so tool-requiring tasks skip the 1min
-# round-trip entirely and go straight to the Portal.
+# The exemplars and centroids live in exemplars.py (shared with the daily
+# self-improvement job). The router hot-reloads them when exemplars.json changes,
+# so newly learned exemplars take effect without a restart.
 
-_ACTION_EXEMPLARS: dict[str, list[str]] = {
-    "action": [
-        "busque o preço do dólar hoje",
-        "pesquise na web sobre isso",
-        "leia este arquivo",
-        "abra o documento",
-        "execute este comando",
-        "rode o script",
-        "crie um arquivo",
-        "salve esta nota",
-        "envie um email",
-        "agende um lembrete",
-        "verifique meu email",
-        "cheque o status",
-        "baixe este arquivo",
-        "instale este pacote",
-        "acesse o site",
-        "calcule 2 mais 2",
-        "mostre a previsão do tempo",
-        "qual o valor do bitcoin agora",
-        "consulte a cotação atual",
-        "o que está acontecendo hoje",
-        "me lembre de comprar leite",
-        "adicione uma tarefa",
-    ],
-    "text": [
-        "formate em tabela",
-        "traduza este texto",
-        "resuma isso",
-        "explique o que é entropia",
-        "por que o céu é azul",
-        "me dê ideias de nome",
-        "qual a diferença entre vírus e bactéria",
-        "liste os itens",
-        "corrija a ortografia",
-        "escreva um texto sobre",
-        "o que significa esta palavra",
-        "me dê 3 dicas",
-        "reorganize essa lista",
-        "corrija a gramática",
-    ],
-}
+_EXEMPLARS_PATH = Path.home() / ".hermes" / "one-min-adapter" / "exemplars.json"
+_exemplars_state: dict = {"mtime": None, "centroids": None}
 
 
-def _tokenize(text: str) -> list[str]:
-    return re.findall(r"[a-zà-ú0-9]+", text.lower())
+def _get_centroids() -> dict[str, dict[str, float]]:
+    """Return centroids, rebuilding them only when exemplars.json changed.
 
-
-def _build_centroids(exemplars: dict[str, list[str]]) -> dict[str, dict[str, float]]:
-    """Average TF-IDF vector per class. Returns {class: {token: weight}}."""
-    docs = {cls: [_tokenize(d) for d in lst] for cls, lst in exemplars.items()}
-    df: Counter[str] = Counter()
-    for lst in docs.values():
-        for d in lst:
-            for tok in set(d):
-                df[tok] += 1
-    n = sum(len(lst) for lst in docs.values())
-    idf = {tok: math.log((1 + n) / (1 + c)) + 1.0 for tok, c in df.items()}
-
-    centroids: dict[str, dict[str, float]] = {}
-    for cls, lst in docs.items():
-        vec: dict[str, float] = {}
-        for d in lst:
-            tf = Counter(d)
-            for tok, cnt in tf.items():
-                vec[tok] = vec.get(tok, 0.0) + (1.0 + math.log(cnt)) * idf.get(tok, 1.0)
-        m = len(lst)
-        centroids[cls] = {tok: v / m for tok, v in vec.items()}
-    return centroids
-
-
-def _cosine(a: dict[str, float], b: dict[str, float]) -> float:
-    common = set(a) & set(b)
-    if not common:
-        return 0.0
-    dot = sum(a[t] * b[t] for t in common)
-    na = math.sqrt(sum(v * v for v in a.values()))
-    nb = math.sqrt(sum(v * v for v in b.values()))
-    if na == 0.0 or nb == 0.0:
-        return 0.0
-    return dot / (na * nb)
-
-
-_CENTROIDS = _build_centroids(_ACTION_EXEMPLARS)
+    One os.path.getmtime() per call is ~microseconds — negligible on the hot
+    path, but it lets the daily job's write take effect immediately.
+    """
+    try:
+        mtime = _EXEMPLARS_PATH.stat().st_mtime if _EXEMPLARS_PATH.exists() else None
+    except OSError:
+        mtime = None
+    if mtime != _exemplars_state["mtime"] or _exemplars_state["centroids"] is None:
+        _exemplars_state["centroids"] = build_centroids(load_exemplars(_EXEMPLARS_PATH))
+        _exemplars_state["mtime"] = mtime
+    return _exemplars_state["centroids"]
 
 
 def _needs_tool(text: str) -> bool:
     """True when the task vector is closer to the 'action' centroid than 'text'."""
-    toks = _tokenize(text)
-    if not toks:
+    vec = _vec(text)
+    if not vec:
         return False
-    tf = Counter(toks)
-    vec = {t: (1.0 + math.log(c)) * _CENTROIDS["action"].get(t, 1.0) for t, c in tf.items()}
-    # Weight the token by idf is already done via centroid values; here we reuse
-    # a simple tf weight — cosine is dominated by shared tokens either way.
-    return _cosine(vec, _CENTROIDS["action"]) > _cosine(vec, _CENTROIDS["text"])
+    centroids = _get_centroids()
+    return _cosine(vec, centroids["action"]) > _cosine(vec, centroids["text"])
+
+
+def _log_usage(text: str, action: bool | None) -> None:
+    """Append one usage record for the daily self-improvement job.
+
+    ``action`` is the system's ground truth: True (routed to Portal for a tool),
+    False (answered by 1min as pure text), or None (heavy task that never went
+    through the action/text index — not learnable). Best-effort: logging must
+    never break a request, and never block it for more than a few µs.
+    """
+    try:
+        record = json.dumps(
+            {"ts": int(time.time()), "text": _normalize(text), "action": action},
+            ensure_ascii=False,
+        )
+        with open(USAGE_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(record + "\n")
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -505,6 +457,7 @@ async def chat_completions(request: Request):
     if task in ("fast", "mid") and _needs_tool(user_text):
         log.info("action detected → portal (tool required)")
         _record_backend("portal")
+        _log_usage(user_text, action=True)
         return await _forward_portal(body, PORTAL_TOOL_MODEL)
 
     route = ROUTE_TABLE.get(task, ROUTE_TABLE["chat"])
@@ -519,6 +472,7 @@ async def chat_completions(request: Request):
         except Exception as exc:
             log.warning("1min backend failed (%s) — falling back to portal", exc)
             _record_backend("portal")
+            _log_usage(user_text, action=None)  # fallback — not a clean signal
             return await _forward_portal(body, route.get("fallback_model") or "deepseek/deepseek-v4-flash")
         text = _extract_text(record)
 
@@ -527,9 +481,11 @@ async def chat_completions(request: Request):
         if NEED_TOOL in text:
             log.info("1min requested tool → re-routing to portal")
             _record_backend("portal")
+            _log_usage(user_text, action=True)  # learned: this "text" task is really an action
             return await _forward_portal(body, PORTAL_TOOL_MODEL)
 
         _record_backend("1min")
+        _log_usage(user_text, action=False)  # clean text task answered by 1min
         return {
             "id": "chatcmpl-1min",
             "object": "chat.completion",
@@ -541,6 +497,7 @@ async def chat_completions(request: Request):
 
     # Heavy → Portal (full context + tools, cached prefix).
     _record_backend("portal")
+    _log_usage(user_text, action=None)  # heavy task — not action/text learnable
     return await _forward_portal(body, route["model"])
 
 

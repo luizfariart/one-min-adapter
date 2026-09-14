@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-09-14
+
+### Added
+
+- **Continuous self-improvement.** The router logs every request to
+  `usage.jsonl`; a daily launchd job (`self_improve.py`) promotes recurring
+  task texts into the action/text exemplar index, prunes stale ones, and the
+  router hot-reloads the result on the next request. Cold-start guard prevents
+  pruning until there is enough usage evidence; each class is capped at 60
+  exemplars to stay low-latency.
+- Extracted the exemplar store into `exemplars.py` (shared by router and job),
+  with the `improve()` function fully unit-tested (promote/prune/cap/guard).
+
 ## [1.3.0] - 2026-09-14
 
 ### Fixed

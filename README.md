@@ -116,6 +116,27 @@ Two layers decide when a task needs a tool:
 Either way, a lightweight task that unexpectedly needs a tool is never left
 hanging.
 
+## Continuous self-improvement
+
+The router logs every request it sees to `~/.hermes/one-min-adapter/usage.jsonl`
+(a compact, one-line record of the normalized task text and the action/text
+ground truth). A separate daily job — `self_improve.py`, run by launchd at
+04:30 — reads that log and updates the exemplar index:
+
+- **Promotes** recurring tasks: a task text seen ≥ 3 times in the last 30 days
+  becomes an exemplar for the class the system actually assigned it to.
+- **Prunes** stale exemplars whose cosine similarity to recent usage is below
+  threshold — they no longer reflect how you work.
+- **Cold-start guard**: with fewer than 30 usable records, it only promotes,
+  never prunes — a thin log cannot justify dropping a seed exemplar.
+- **Caps** each class at 60 exemplars, keeping the most frequent, so the index
+  stays small and the per-request comparison stays in the microsecond range.
+
+The router hot-reloads `exemplars.json` on the next request when its mtime
+changes, so learning takes effect without a restart. This is the closed loop:
+every request teaches the index, and the index shapes every future request —
+offline, at zero per-request cost.
+
 ## Thrash detection
 
 The router keeps a rolling history of the backend used per request. When the
