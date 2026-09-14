@@ -3,6 +3,7 @@
 Pure logic only: no network, no real 1min.ai/Portal calls.
 """
 
+import asyncio
 import importlib.util
 from pathlib import Path
 
@@ -17,10 +18,18 @@ _SPEC.loader.exec_module(_mod)
 
 
 @pytest.fixture(autouse=True)
-def _reset_thrash():
+def _reset_router_state():
     _mod._reset_thrash_history()
+    if hasattr(_mod, "_reset_runtime_caches"):
+        _mod._reset_runtime_caches()
+    if hasattr(_mod, "_reset_1min_circuit"):
+        _mod._reset_1min_circuit()
     yield
     _mod._reset_thrash_history()
+    if hasattr(_mod, "_reset_runtime_caches"):
+        _mod._reset_runtime_caches()
+    if hasattr(_mod, "_reset_1min_circuit"):
+        _mod._reset_1min_circuit()
 
 
 class TestClassification:
@@ -195,3 +204,159 @@ class TestIsolatedPromptHasNeedToolHandshake:
 
     def test_need_tool_marker_constant(self):
         assert _mod.NEED_TOOL == "[[NEED_TOOL]]"
+
+
+class TestRuntimeCaches:
+    def test_inconclusive_classification_uses_cache(self, monkeypatch):
+        calls = []
+
+        def fake_classifier(text):
+            calls.append(text)
+            return "fast"
+
+        monkeypatch.setattr(_mod, "_classify_with_model", fake_classifier)
+        msg = [{"role": "user", "content": "blorp zigma nebulosa 91827"}]
+        assert _mod.classify(msg) == "fast"
+        assert _mod.classify(msg) == "fast"
+        assert calls == ["blorp zigma nebulosa 91827"]
+
+    def test_needs_tool_uses_cache(self, monkeypatch):
+        calls = []
+
+        def fake_centroids():
+            calls.append(True)
+            return {
+                "action": {"leia": 1.0, "arquivo": 1.0},
+                "text": {"explique": 1.0},
+            }
+
+        monkeypatch.setattr(_mod, "_get_centroids", fake_centroids)
+        text = "leia esse arquivo blorpteste 551"
+        assert _mod._needs_tool(text) is True
+        assert _mod._needs_tool(text) is True
+        assert len(calls) == 1
+
+    def test_portal_cache_stores_and_reads_exact_body(self):
+        body = {
+            "messages": [{"role": "user", "content": "cache portal 441"}],
+            "temperature": 0.1,
+            "stream": False,
+        }
+        assert _mod._portal_cacheable(body)
+        key = _mod._portal_cache_key(body, "openai/gpt-5.4")
+        assert _mod._portal_cache_get(key) is None
+        payload = {"id": "abc", "choices": [{"message": {"content": "ok"}}]}
+        _mod._portal_cache_put(key, payload)
+        assert _mod._portal_cache_get(key) == payload
+
+    def test_portal_cache_skips_stream_and_tool_calls(self):
+        assert not _mod._portal_cacheable({
+            "messages": [{"role": "user", "content": "x"}],
+            "stream": True,
+        })
+        assert not _mod._portal_cacheable({
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [{"type": "function", "function": {"name": "web_search"}}],
+            "stream": False,
+        })
+
+
+class Test1MinCircuitBreaker:
+    def test_open_circuit_skips_model_classification(self, monkeypatch):
+        calls = []
+
+        def fake_classifier(text):
+            calls.append(text)
+            return "fast"
+
+        monkeypatch.setattr(_mod, "_classify_with_model", fake_classifier)
+        _mod._record_1min_failure()
+        _mod._record_1min_failure()
+        msg = [{"role": "user", "content": "mensagem incomum breaker 772"}]
+        assert _mod.classify(msg) == "chat"
+        assert calls == []
+
+    def test_success_closes_circuit_and_resets_failures(self):
+        _mod._record_1min_failure()
+        _mod._record_1min_failure()
+        assert _mod._is_1min_circuit_open()
+        _mod._record_1min_success()
+        assert not _mod._is_1min_circuit_open()
+        assert _mod._1MIN_CONSECUTIVE_FAILURES == 0
+        assert _mod._1MIN_DISABLED_UNTIL == 0.0
+
+    def test_short_prompts_route_to_fast_without_model_call(self, monkeypatch):
+        calls = []
+
+        def fake_classifier(text):
+            calls.append(text)
+            return "chat"
+
+        monkeypatch.setattr(_mod, "_classify_with_model", fake_classifier)
+        msg = [{"role": "user", "content": "ok então"}]
+        assert _mod.classify(msg) == "fast"
+        assert calls == []
+
+    def test_open_circuit_persists_to_disk(self, monkeypatch, tmp_path):
+        state_path = tmp_path / "router_state.json"
+        monkeypatch.setattr(_mod, "_ROUTER_STATE_PATH", state_path)
+        _mod._record_1min_failure()
+        _mod._record_1min_failure()
+        assert state_path.exists()
+
+        _mod._reset_1min_circuit()
+        assert not _mod._is_1min_circuit_open()
+        _mod._load_1min_circuit_state()
+        assert _mod._is_1min_circuit_open()
+        assert _mod._1MIN_CONSECUTIVE_FAILURES >= 2
+
+    def test_success_persists_closed_circuit(self, monkeypatch, tmp_path):
+        state_path = tmp_path / "router_state.json"
+        monkeypatch.setattr(_mod, "_ROUTER_STATE_PATH", state_path)
+        _mod._record_1min_failure()
+        _mod._record_1min_failure()
+        _mod._record_1min_success()
+        _mod._reset_1min_circuit()
+        _mod._load_1min_circuit_state()
+        assert not _mod._is_1min_circuit_open()
+        assert _mod._1MIN_CONSECUTIVE_FAILURES == 0
+
+    def test_probe_does_not_clear_failures_before_threshold(self, monkeypatch, tmp_path):
+        state_path = tmp_path / "router_state.json"
+        monkeypatch.setattr(_mod, "_ROUTER_STATE_PATH", state_path)
+        _mod._record_1min_failure()
+        assert not _mod._is_1min_circuit_open()
+        assert _mod._1MIN_CONSECUTIVE_FAILURES == 1
+        _mod._record_1min_failure()
+        assert _mod._is_1min_circuit_open()
+        assert _mod._1MIN_CONSECUTIVE_FAILURES == 2
+
+
+class TestPortalInflightDedup:
+    def test_identical_requests_share_one_upstream_call(self, monkeypatch):
+        calls = []
+
+        async def fake_fetch(payload):
+            calls.append(payload)
+            await asyncio.sleep(0.05)
+            return {"id": "shared", "choices": [{"message": {"content": "ok"}}]}
+
+        monkeypatch.setattr(_mod, "_fetch_portal_json", fake_fetch)
+        body = {
+            "messages": [{"role": "user", "content": "dedupe portal 991"}],
+            "stream": False,
+        }
+        payload = _mod._portal_payload(body, "openai/gpt-5.4")
+
+        async def run():
+            return await asyncio.gather(
+                _mod._get_portal_json(payload, "openai/gpt-5.4"),
+                _mod._get_portal_json(payload, "openai/gpt-5.4"),
+            )
+
+        results = asyncio.run(run())
+        assert len(calls) == 1
+        sources = sorted(source for _, source in results)
+        assert sources == ["coalesced", "miss"]
+        assert results[0][0]["choices"][0]["message"]["content"] == "ok"
+        assert results[1][0]["choices"][0]["message"]["content"] == "ok"

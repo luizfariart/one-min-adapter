@@ -5,6 +5,47 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-09-14
+
+### Added
+
+- **1min.ai circuit breaker.** After `ONEMIN_FAILURE_THRESHOLD` (2) consecutive
+  1min failures, the router stops calling 1min entirely for
+  `ONEMIN_CIRCUIT_OPEN_S` (180s) and routes straight to the Portal — no more
+  dead-time waiting on a stalled backend. A real success (or genuine circuit
+  expiry) re-closes it.
+- **Breaker persistence.** The failure count and `disabled_until` are written
+  atomically (tmp+rename) to
+  `~/.hermes/one-min-adapter/router_state.json` and reloaded at startup, so a
+  daemon restart no longer re-pays the discovery cost of two dead requests.
+- **Per-backend timeouts.** `ONEMIN_REQUEST_TIMEOUT` (5s) + `CLASSIFY_TIMEOUT`
+  (3s) keep the 1min path snappy; `PORTAL_REQUEST_TIMEOUT` (30s) gives the
+  Portal normal model latency without false 502s.
+- **Local runtime caches.** `classify` and `_needs_tool` results are cached per
+  normalized text (TTL 600s). Short low-stakes prompts (`ok`, `sim`, `segue`,
+  `valeu`, …) classify directly to `fast` with no model round-trip, so they
+  fall back to `deepseek-v4-flash` instead of `gpt-5.4` when 1min is down.
+- **Strict short response cache + in-flight coalescing.** Non-streaming,
+  tool-free Portal responses are cached by exact body+model hash (TTL 45s).
+  Identical requests that arrive while the first is still in flight share one
+  upstream call — reported via `X-Hermes-Router-Cache: miss | coalesced | hit`.
+- `/health` now exposes `1min_circuit_open`, `1min_disabled_for_s`,
+  `cache_entries` and `portal_inflight`.
+
+### Fixed
+
+- **Circuit probe cleared failures below threshold.** `_is_1min_circuit_open()`
+  reset the failure counter on every probe, so the breaker could never reach
+  the threshold and open. It now resets only on real success or genuine expiry.
+
+### Diagnosis (root cause of the latency and cost)
+
+The 1min.ai `/api/chat-with-ai` endpoint stopped answering (read timeouts, zero
+successful `fast`/`mid` routes logged). Every lightweight request then paid the
+full 15s timeout before falling back to the Portal — the source of the
+"why do responses take so long" symptom (~17s per affected turn) and of
+repeated spend on duplicate/retried requests.
+
 ## [1.5.0] - 2026-09-14
 
 ### Added

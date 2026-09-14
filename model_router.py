@@ -41,6 +41,7 @@ import json
 import logging
 import os
 import time
+import hashlib
 from pathlib import Path
 import asyncio
 
@@ -64,7 +65,27 @@ ONEMIN_API_BASE = "https://api.1min.ai"
 ONEMIN_CHAT_PATH = "/api/chat-with-ai"
 PORTAL_PROXY_URL = os.environ.get("PORTAL_PROXY_URL", "http://127.0.0.1:8645/v1")
 
-REQUEST_TIMEOUT = 15  # per-request cap: 300→60→15s; fallback to Portal kicks in quickly
+ONEMIN_REQUEST_TIMEOUT = 5   # keep fallback snappy when 1min stalls
+PORTAL_REQUEST_TIMEOUT = 30  # allow normal model latency without false 502s
+CLASSIFY_TIMEOUT = 3         # the classifier should never add double-digit latency
+
+CLASSIFY_CACHE_TTL_S = 600
+TOOL_NEED_CACHE_TTL_S = 600
+PORTAL_CACHE_TTL_S = 45
+RUNTIME_CACHE_MAX_ENTRIES = 256
+
+ONEMIN_FAILURE_THRESHOLD = 2
+ONEMIN_CIRCUIT_OPEN_S = 180
+_1MIN_CONSECUTIVE_FAILURES = 0
+_1MIN_DISABLED_UNTIL = 0.0
+
+_classify_cache: dict[str, tuple[float, str]] = {}
+_tool_need_cache: dict[str, tuple[float, bool]] = {}
+_portal_response_cache: dict[str, tuple[float, dict]] = {}
+_portal_inflight: dict[str, asyncio.Future] = {}
+
+_HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+_ROUTER_STATE_PATH = Path(os.environ.get("ROUTER_STATE_PATH", str(_HERMES_HOME / "one-min-adapter" / "router_state.json")))
 
 # Marker the 1min model must emit when the task needs an external tool/action.
 NEED_TOOL = "[[NEED_TOOL]]"
@@ -131,6 +152,136 @@ _EXEMPLARS_PATH = Path.home() / ".hermes" / "one-min-adapter" / "exemplars.json"
 _exemplars_state: dict = {"mtime": None, "centroids": None}
 
 
+def _prune_expired(cache: dict) -> None:
+    now = time.time()
+    expired = [k for k, (until, _) in cache.items() if until <= now]
+    for k in expired:
+        cache.pop(k, None)
+
+
+def _cache_get(cache: dict, key: str):
+    item = cache.get(key)
+    if not item:
+        return None
+    until, value = item
+    if until <= time.time():
+        cache.pop(key, None)
+        return None
+    return value
+
+
+def _cache_put(cache: dict, key: str, value, ttl_s: int) -> None:
+    _prune_expired(cache)
+    if len(cache) >= RUNTIME_CACHE_MAX_ENTRIES:
+        oldest = next(iter(cache))
+        cache.pop(oldest, None)
+    cache[key] = (time.time() + ttl_s, value)
+
+
+def _json_clone(value):
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _router_state_payload() -> dict:
+    return {
+        "one_min_consecutive_failures": _1MIN_CONSECUTIVE_FAILURES,
+        "one_min_disabled_until": _1MIN_DISABLED_UNTIL,
+    }
+
+
+def _save_1min_circuit_state() -> None:
+    try:
+        _ROUTER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _ROUTER_STATE_PATH.with_suffix(_ROUTER_STATE_PATH.suffix + ".tmp")
+        tmp.write_text(json.dumps(_router_state_payload(), ensure_ascii=False), encoding="utf-8")
+        tmp.replace(_ROUTER_STATE_PATH)
+    except Exception:
+        pass
+
+
+def _load_1min_circuit_state() -> None:
+    global _1MIN_CONSECUTIVE_FAILURES, _1MIN_DISABLED_UNTIL
+    try:
+        if not _ROUTER_STATE_PATH.exists():
+            return
+        data = json.loads(_ROUTER_STATE_PATH.read_text(encoding="utf-8"))
+        _1MIN_CONSECUTIVE_FAILURES = max(0, int(data.get("one_min_consecutive_failures", 0)))
+        _1MIN_DISABLED_UNTIL = max(0.0, float(data.get("one_min_disabled_until", 0.0)))
+        if _1MIN_DISABLED_UNTIL <= time.time():
+            _1MIN_CONSECUTIVE_FAILURES = 0
+            _1MIN_DISABLED_UNTIL = 0.0
+    except Exception:
+        _1MIN_CONSECUTIVE_FAILURES = 0
+        _1MIN_DISABLED_UNTIL = 0.0
+
+
+def _reset_runtime_caches() -> None:
+    _classify_cache.clear()
+    _tool_need_cache.clear()
+    _portal_response_cache.clear()
+    _portal_inflight.clear()
+
+
+def _record_1min_failure() -> None:
+    global _1MIN_CONSECUTIVE_FAILURES, _1MIN_DISABLED_UNTIL
+    _1MIN_CONSECUTIVE_FAILURES += 1
+    if _1MIN_CONSECUTIVE_FAILURES >= ONEMIN_FAILURE_THRESHOLD:
+        _1MIN_DISABLED_UNTIL = time.time() + ONEMIN_CIRCUIT_OPEN_S
+    _save_1min_circuit_state()
+
+
+def _record_1min_success() -> None:
+    global _1MIN_CONSECUTIVE_FAILURES, _1MIN_DISABLED_UNTIL
+    _1MIN_CONSECUTIVE_FAILURES = 0
+    _1MIN_DISABLED_UNTIL = 0.0
+    _save_1min_circuit_state()
+
+
+def _is_1min_circuit_open() -> bool:
+    if _1MIN_DISABLED_UNTIL > time.time():
+        return True
+    if _1MIN_DISABLED_UNTIL != 0.0:
+        _record_1min_success()
+    return False
+
+
+def _reset_1min_circuit() -> None:
+    global _1MIN_CONSECUTIVE_FAILURES, _1MIN_DISABLED_UNTIL
+    _1MIN_CONSECUTIVE_FAILURES = 0
+    _1MIN_DISABLED_UNTIL = 0.0
+
+
+def _portal_cacheable(body: dict) -> bool:
+    return not body.get("stream") and not body.get("tools")
+
+
+def _portal_cache_key(body: dict, model: str) -> str:
+    digest = hashlib.sha256(
+        json.dumps({"model": model, "body": body}, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return digest
+
+
+def _portal_cache_get(key: str) -> dict | None:
+    value = _cache_get(_portal_response_cache, key)
+    return _json_clone(value) if value is not None else None
+
+
+def _portal_cache_put(key: str, value: dict) -> None:
+    _cache_put(_portal_response_cache, key, _json_clone(value), PORTAL_CACHE_TTL_S)
+
+
+_SHORT_FAST_LEAD_WORDS = {
+    "ok", "beleza", "blz", "segue", "continua", "continue", "sim", "não", "nao",
+    "valeu", "obrigado", "manda", "pode", "certo", "show",
+}
+
+
+def _is_short_low_stakes_prompt(text: str) -> bool:
+    words = text.split()
+    return 0 < len(words) <= 3 and len(text) <= 24 and words[0] in _SHORT_FAST_LEAD_WORDS
+
+
 def _get_centroids() -> dict[str, dict[str, float]]:
     """Return centroids, rebuilding them only when exemplars.json changed.
 
@@ -144,16 +295,24 @@ def _get_centroids() -> dict[str, dict[str, float]]:
     if mtime != _exemplars_state["mtime"] or _exemplars_state["centroids"] is None:
         _exemplars_state["centroids"] = build_centroids(load_exemplars(_EXEMPLARS_PATH))
         _exemplars_state["mtime"] = mtime
+        _tool_need_cache.clear()
     return _exemplars_state["centroids"]
 
 
 def _needs_tool(text: str) -> bool:
     """True when the task vector is closer to the 'action' centroid than 'text'."""
+    norm = _normalize(text)
+    cached = _cache_get(_tool_need_cache, norm)
+    if cached is not None:
+        return cached
+
     vec = _vec(text)
     if not vec:
         return False
     centroids = _get_centroids()
-    return _cosine(vec, centroids["action"]) > _cosine(vec, centroids["text"])
+    result = _cosine(vec, centroids["action"]) > _cosine(vec, centroids["text"])
+    _cache_put(_tool_need_cache, norm, result, TOOL_NEED_CACHE_TTL_S)
+    return result
 
 
 def _log_usage(text: str, action: bool | None) -> None:
@@ -242,7 +401,7 @@ def _looks_portuguese(text: str) -> bool:
 def classify(messages: list[dict]) -> str:
     """Classify the task. Deterministic rules first (free), then the cheap
     1min.ai model only if inconclusive. Never raises; falls back to 'chat'."""
-    text = _last_user_text(messages).lower()
+    text = _last_user_text(messages).lower().strip()
     if not text:
         return "chat"
 
@@ -250,14 +409,28 @@ def classify(messages: list[dict]) -> str:
         if any(kw in text for kw in kws):
             return cls
 
-    try:
-        return _classify_with_model(text)
-    except Exception:
+    if _is_short_low_stakes_prompt(text):
+        return "fast"
+
+    cached = _cache_get(_classify_cache, text)
+    if cached is not None:
+        return cached
+
+    if _is_1min_circuit_open():
         return "chat"
+
+    try:
+        result = _classify_with_model(text)
+    except Exception:
+        result = "chat"
+    _cache_put(_classify_cache, text, result, CLASSIFY_CACHE_TTL_S)
+    return result
 
 
 def _classify_with_model(text: str) -> str:
     """Free/cheap classification via 1min.ai deepseek-flash."""
+    if _is_1min_circuit_open():
+        return "chat"
     key = _api_key()
     if not key:
         return "chat"
@@ -272,19 +445,22 @@ def _classify_with_model(text: str) -> str:
         "promptObject": {"prompt": prompt},
     }
     try:
-        with httpx.Client(timeout=10) as client:
+        with httpx.Client(timeout=CLASSIFY_TIMEOUT) as client:
             resp = client.post(
                 f"{ONEMIN_API_BASE}{ONEMIN_CHAT_PATH}",
                 headers={"API-KEY": key, "Content-Type": "application/json"},
                 json=payload,
             )
         resp.raise_for_status()
+        record = resp.json().get("aiRecord") or {}
+        detail = record.get("aiRecordDetail") or {}
+        result = detail.get("resultObject") or []
+        answer = "".join(str(x) for x in result).strip().lower()
     except Exception:
+        _record_1min_failure()
         return "chat"
-    record = resp.json().get("aiRecord") or {}
-    detail = record.get("aiRecordDetail") or {}
-    result = detail.get("resultObject") or []
-    answer = "".join(str(x) for x in result).strip().lower()
+
+    _record_1min_success()
     for cls in ROUTE_TABLE:
         if cls in answer:
             return cls
@@ -379,6 +555,8 @@ def _call_1min(prompt: str, model: str) -> dict:
 
     Synchronous but called via ``asyncio.to_thread`` from the async handler so
     it never blocks the uvicorn event loop — critical for concurrent routing."""
+    if _is_1min_circuit_open():
+        raise RuntimeError("1min circuit open")
     key = _api_key()
     if not key:
         raise ValueError("1min.ai API key not configured")
@@ -387,20 +565,26 @@ def _call_1min(prompt: str, model: str) -> dict:
         "model": _ONEMIN_MODEL_MAP.get(model, model),
         "promptObject": {"prompt": prompt, "settings": {"webSearchSettings": {"webSearch": False}}},
     }
-    with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-        resp = client.post(
-            f"{ONEMIN_API_BASE}{ONEMIN_CHAT_PATH}",
-            headers={"API-KEY": key, "Content-Type": "application/json"},
-            json=payload,
-        )
-    if resp.status_code == 401:
-        raise PermissionError("1min.ai returned 401")
-    if resp.status_code == 429:
-        raise RuntimeError("1min.ai returned 429 — rate limited or credits exhausted")
-    resp.raise_for_status()
-    record = resp.json().get("aiRecord") or {}
-    if record.get("status") == "FAILED":
-        raise RuntimeError("1min.ai request FAILED")
+    try:
+        with httpx.Client(timeout=ONEMIN_REQUEST_TIMEOUT) as client:
+            resp = client.post(
+                f"{ONEMIN_API_BASE}{ONEMIN_CHAT_PATH}",
+                headers={"API-KEY": key, "Content-Type": "application/json"},
+                json=payload,
+            )
+        if resp.status_code == 401:
+            raise PermissionError("1min.ai returned 401")
+        if resp.status_code == 429:
+            raise RuntimeError("1min.ai returned 429 — rate limited or credits exhausted")
+        resp.raise_for_status()
+        record = resp.json().get("aiRecord") or {}
+        if record.get("status") == "FAILED":
+            raise RuntimeError("1min.ai request FAILED")
+    except Exception:
+        _record_1min_failure()
+        raise
+
+    _record_1min_success()
     return record
 
 
@@ -420,9 +604,58 @@ def _portal_payload(body: dict, model: str) -> dict:
     return payload
 
 
+async def _fetch_portal_json(payload: dict) -> dict:
+    async with httpx.AsyncClient(timeout=PORTAL_REQUEST_TIMEOUT) as client:
+        upstream = await client.post(
+            f"{PORTAL_PROXY_URL}/chat/completions",
+            headers={"Authorization": "Bearer hermes-router"},
+            json=payload,
+        )
+
+    try:
+        data = upstream.json()
+    except Exception:
+        raise RuntimeError(f"portal proxy HTTP {upstream.status_code}, non-JSON body") from None
+    if upstream.status_code >= 400:
+        raise RuntimeError(json.dumps(data, ensure_ascii=False))
+    return data
+
+
+async def _get_portal_json(payload: dict, model: str) -> tuple[dict, str]:
+    cacheable = _portal_cacheable(payload)
+    if not cacheable:
+        return await _fetch_portal_json(payload), "bypass"
+
+    cache_key = _portal_cache_key(payload, model)
+    cached = _portal_cache_get(cache_key)
+    if cached is not None:
+        return cached, "hit"
+
+    inflight = _portal_inflight.get(cache_key)
+    if inflight is not None:
+        data = await asyncio.shield(inflight)
+        return _json_clone(data), "coalesced"
+
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    _portal_inflight[cache_key] = future
+    try:
+        data = await _fetch_portal_json(payload)
+        _portal_cache_put(cache_key, data)
+        future.set_result(_json_clone(data))
+        return data, "miss"
+    except Exception as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        _portal_inflight.pop(cache_key, None)
+
+
 # --------------------------------------------------------------------------- #
 # FastAPI app
 # --------------------------------------------------------------------------- #
+
+_load_1min_circuit_state()
 
 app = FastAPI(title="Hermes model router")
 
@@ -434,6 +667,14 @@ def health():
         "1min_key_configured": bool(_api_key()),
         "portal_proxy": PORTAL_PROXY_URL,
         "thrash": _detect_thrash(),
+        "1min_circuit_open": _is_1min_circuit_open(),
+        "1min_disabled_for_s": round(max(0.0, _1MIN_DISABLED_UNTIL - time.time()), 3),
+        "cache_entries": {
+            "classify": len(_classify_cache),
+            "tool_need": len(_tool_need_cache),
+            "portal": len(_portal_response_cache),
+        },
+        "portal_inflight": len(_portal_inflight),
     }
 
 
@@ -516,17 +757,17 @@ async def _forward_portal(body: dict, model: str):
     tool_choice so the agent can actually perform actions."""
     payload = _portal_payload(body, model)
     stream = bool(payload.get("stream", False))
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            upstream = await client.post(
-                f"{PORTAL_PROXY_URL}/chat/completions",
-                headers={"Authorization": "Bearer hermes-router"},
-                json=payload,
-            )
-    except Exception as exc:
-        return _openai_error(502, "portal_proxy_error", f"portal proxy unreachable: {exc}")
 
     if stream:
+        try:
+            async with httpx.AsyncClient(timeout=PORTAL_REQUEST_TIMEOUT) as client:
+                upstream = await client.post(
+                    f"{PORTAL_PROXY_URL}/chat/completions",
+                    headers={"Authorization": "Bearer hermes-router"},
+                    json=payload,
+                )
+        except Exception as exc:
+            return _openai_error(502, "portal_proxy_error", f"portal proxy unreachable: {exc}")
         return StreamingResponse(
             _relay_stream(upstream),
             media_type="text/event-stream",
@@ -534,12 +775,10 @@ async def _forward_portal(body: dict, model: str):
         )
 
     try:
-        data = upstream.json()
-    except Exception:
-        return _openai_error(502, "portal_proxy_error", f"portal proxy HTTP {upstream.status_code}, non-JSON body")
-    if upstream.status_code >= 400:
-        return JSONResponse(status_code=upstream.status_code, content=data)
-    return JSONResponse(content=data)
+        data, source = await _get_portal_json(payload, model)
+    except Exception as exc:
+        return _openai_error(502, "portal_proxy_error", f"portal proxy unreachable: {exc}")
+    return JSONResponse(content=data, headers={"X-Hermes-Router-Cache": source})
 
 
 async def _relay_stream(upstream: httpx.Response):
