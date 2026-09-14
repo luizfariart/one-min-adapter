@@ -1,89 +1,88 @@
-# 1min.ai Adapter
+# 1min.ai Adapter + Model Router
 
-An OpenAI-compatible adapter for the [1min.ai](https://1min.ai) API. It exposes
-a local `POST /v1/chat/completions` endpoint and translates requests to 1min.ai's
-proprietary `POST /api/chat-with-ai` format — and responses back. Point any
-OpenAI-compatible client (Hermes Agent, Codex, Aider, etc.) at it and use your
-1min.ai credit balance as a model provider.
+Two local services that give the [Hermes Agent](https://hermes-agent.nousresearch.com)
+dynamic, per-request model routing over the [1min.ai](https://1min.ai) credit
+balance, without spending Portal dollars on cheap work.
 
-## Why this exists
+- **`model_router.py`** — a local OpenAI-compatible proxy that classifies every
+  request (deterministic rules → free/cheap model) and routes it to 1min.ai or
+  the Nous Portal.
+- **`one_min_adapter.py`** — a standalone 1min.ai adapter (chat only) for
+  clients that just want a 1min.ai endpoint, no routing.
+- **`com.hermes.portal-proxy.plist`** — launchd unit that runs `hermes proxy`
+  (the native OAuth bridge to the Portal) on `:8645`.
 
-1min.ai sells credit bundles (GPT, Claude, Gemini, DeepSeek, Grok, and more
-through one key), but its API is **not** OpenAI-compatible:
+## Architecture
 
-| | OpenAI-compatible | 1min.ai native |
-|---|---|---|
-| Endpoint | `POST /v1/chat/completions` | `POST /api/chat-with-ai` |
-| Auth header | `Authorization: Bearer …` | `API-KEY: …` |
-| Request body | `{ messages: [...] }` | `{ type, model, promptObject: { prompt } }` |
-| Response | `choices[0].message.content` | `aiRecord.aiRecordDetail.resultObject` |
+```
+Hermes Agent
+    │  model.provider = custom
+    │  base_url = http://127.0.0.1:8400/v1
+    ▼
+model_router (:8400)            ← classifies every request
+    ├── fast → 1min.ai          ← pre-paid credit balance (deepseek-flash)
+    └── code/research/chat/review
+              │  forwards to
+              ▼
+        hermes proxy (:8645)    ← attaches Nous OAuth
+              ▼
+        Nous Portal
+```
 
-This adapter sits in between and speaks OpenAI on the local side, 1min.ai on the
-remote side. It also bridges the two streaming formats (SSE ↔ SSE).
+Every request is classified (keyword rules first — free; a cheap model only when
+ambiguous) and routed. If 1min.ai fails (credits exhausted, rate limit, timeout),
+the request falls back to the Portal automatically. If the router itself is
+down, Hermes' `fallback_model` points straight at the Portal. **A request never
+dies because a credit backend is down.**
 
-## Features
+## Why a router and not `/model` switching
 
-- **Non-streaming** and **streaming** (`stream: true`, SSE) chat completions.
-- **Model mapping** — short OpenAI-style names (`deepseek-v4-flash`) map to
-  1min.ai model IDs (`deepseek-flash`); unknown IDs pass through unchanged.
-- **Graceful failure** — 401, 429, exhausted credits, network timeouts, and any
-  1min.ai error become proper OpenAI-style error responses (or an SSE `error`
-  chunk + `[DONE]`), so the caller's fallback chain catches them and moves on.
-  The adapter never hangs and never returns a half-formed 200.
-- **`GET /v1/models`** and **`GET /health`** for discovery and monitoring.
-- **Zero secrets in the repo** — the API key is read from a `chmod 600` file
-  (`~/.hermes/secrets/1min.key` by default) or the `ONEMIN_API_KEY` env var.
+Hermes has no native dynamic router: `/model` is manual, the fallback chain
+fires on *failure* (not on classification), `smart_model_routing` is a
+setup-wizard stub, and the `pre_llm_call` hook can inject context but cannot
+change the model. The only correct way to route by task type on every turn is a
+proxy in front of the agent — which is exactly what `model_router.py` is.
 
 ## Install
 
 ```bash
-# 1. Save your API key (never commit it)
+# 1. Save your 1min.ai API key (never commit it)
 printf '%s' '<your-key>' > ~/.hermes/secrets/1min.key
 chmod 600 ~/.hermes/secrets/1min.key
 
-# 2. Run (foreground) — or use install.sh for a launchd daemon
-~/.hermes/hermes-agent/venv/bin/python3 one_min_adapter.py
-
-# 3. Verify
-curl -s http://127.0.0.1:8400/health
-curl -s http://127.0.0.1:8400/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"Say OK"}]}'
-```
-
-### Run as a launchd daemon (macOS)
-
-```bash
+# 2. Install both launchd daemons (router + portal proxy)
 ./install.sh
-```
 
-Generates `~/Library/LaunchAgents/com.hermes.one-min-adapter.plist` with this
-user's paths, registers it, and keeps it alive across reboots (KeepAlive).
+# 3. Point Hermes at the router
+hermes config set model.provider custom
+hermes config set model.base_url "http://127.0.0.1:8400/v1"
+hermes config set fallback_model.provider nous
+hermes config set fallback_model.model "deepseek/deepseek-v4-pro"
+
+# 4. Verify
+curl -s http://127.0.0.1:8400/health
+```
 
 ## Configuration
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `ONEMIN_PORT` | `8400` | Local listen port |
-| `ONEMIN_KEY_FILE` | `~/.hermes/secrets/1min.key` | Path to the API key file |
+| `ROUTER_PORT` | `8400` | Router listen port |
+| `PORTAL_PROXY_URL` | `http://127.0.0.1:8645/v1` | Where the Portal OAuth proxy lives |
+| `ONEMIN_KEY_FILE` | `~/.hermes/secrets/1min.key` | 1min.ai API key file |
 | `ONEMIN_API_KEY` | — | Inline key (overrides the file) |
 
-## Using with Hermes Agent
+## Routing table
 
-Register the adapter as a `custom` provider, then route to it via a model alias:
+Edit `ROUTE_TABLE` in `model_router.py` to change which task class goes where:
 
-```yaml
-# config.yaml
-model:
-  aliases:
-    fast-1min:
-      model: deepseek-v4-flash
-      provider: custom
-      base_url: "http://127.0.0.1:8400/v1"
-```
-
-The model-router skill routes cheap `fast` tasks to this alias and heavy tasks
-to the primary provider, so the credit balance absorbs the low-value work.
+| Class | Backend | Model |
+|---|---|---|
+| `fast` | 1min.ai | `deepseek-flash` (fallback: Portal `deepseek-v4-flash`) |
+| `code` | Portal | `deepseek/deepseek-v4-pro` |
+| `research` | Portal | `anthropic/claude-opus-5` |
+| `chat` | Portal | `openai/gpt-5.4` |
+| `review` | Portal | `kwaipilot/kat-coder-pro-v2.5` |
 
 ## Development
 
@@ -93,10 +92,12 @@ to the primary provider, so the credit balance absorbs the low-value work.
 
 ## Limitations
 
-- The 1min.ai chat endpoint takes a single prompt string, so multi-turn
-  `messages` are flattened (system → framed, assistant → `Assistant:` prefix).
-  Tool/function-calling is not yet supported; multimodal (image/video/audio)
-  endpoints are not exposed by this adapter (1min.ai supports them natively).
+- 1min.ai's chat endpoint takes a single prompt string, so multi-turn `messages`
+  are flattened. Tool/function-calling is not supported through the adapter.
+- The standalone adapter covers chat only; 1min.ai's image/video/audio endpoints
+  are not exposed yet (the router does not route them).
+- Prompt caching on the Portal is broken on each model switch — the inherent
+  cost of per-request dynamic routing.
 
 ## License
 

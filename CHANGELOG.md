@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-09-14
+
+### Added
+
+- `model_router.py` — dynamic per-request routing: classifies every request
+  (deterministic keyword rules → free 1min.ai model when ambiguous) and routes
+  to 1min.ai (fast) or the Nous Portal (code/research/chat/review).
+- `com.hermes.portal-proxy.plist` + install flow for the native `hermes proxy`
+  OAuth bridge to the Portal (`:8645`).
+- Graceful fallback: 1min failure → Portal; router down → Hermes `fallback_model`.
+
+### Changed
+
+- The production daemon now runs the router instead of the plain adapter.
+
 ## [1.0.0] - 2026-09-14
 
 ### Added

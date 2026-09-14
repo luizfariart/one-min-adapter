@@ -1,21 +1,27 @@
 #!/bin/bash
-# Install the 1min.ai adapter: generate the launchd plist for this user and
-# register the daemon so it survives reboots.
+# Install both daemons: the model router (:8400) and the portal OAuth proxy
+# (:8645). Generates launchd plists for this user and registers them.
 set -e
 
 ADAPTER_DIR="$(cd "$(dirname "$0")" && pwd)"
-HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python3"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
-LABEL="com.hermes.one-min-adapter"
+UID_NUM=$(id -u)
 
-# The plist ships with /Users/<user> placeholders; substitute this user's home.
+# --- model router (:8400) ---
+ROUTER_LABEL="com.hermes.one-min-adapter"
 sed -e "s#/Users/<user>#$HOME#g" \
     "$ADAPTER_DIR/com.hermes.one-min-adapter.plist" \
-    > "$LAUNCH_AGENTS/$LABEL.plist"
+    > "$LAUNCH_AGENTS/$ROUTER_LABEL.plist"
+echo "==> router plist: $LAUNCH_AGENTS/$ROUTER_LABEL.plist"
 
-echo "==> plist generated: $LAUNCH_AGENTS/$LABEL.plist"
+# --- portal OAuth proxy (:8645) ---
+PORTAL_LABEL="com.hermes.portal-proxy"
+sed -e "s#/Users/<user>#$HOME#g" \
+    "$ADAPTER_DIR/com.hermes.portal-proxy.plist" \
+    > "$LAUNCH_AGENTS/$PORTAL_LABEL.plist"
+echo "==> portal proxy plist: $LAUNCH_AGENTS/$PORTAL_LABEL.plist"
 
-# Confirm the API key file exists (created separately, chmod 600).
+# API key check (router needs it for the 1min.ai backend)
 KEY_FILE="$HOME/.hermes/secrets/1min.key"
 if [ ! -f "$KEY_FILE" ]; then
     echo "!! warning: API key not found at $KEY_FILE"
@@ -24,10 +30,17 @@ else
     echo "==> API key present at $KEY_FILE"
 fi
 
-echo "==> Registering with launchd"
-UID_NUM=$(id -u)
-launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$UID_NUM" "$LAUNCH_AGENTS/$LABEL.plist"
+# Register both (bootout first to apply env-var changes cleanly)
+for LABEL in "$ROUTER_LABEL" "$PORTAL_LABEL"; do
+    launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
+done
+sleep 1
+for LABEL in "$ROUTER_LABEL" "$PORTAL_LABEL"; do
+    launchctl bootstrap "gui/$UID_NUM" "$LAUNCH_AGENTS/$LABEL.plist"
+    echo "==> registered: $LABEL"
+done
 
-echo "==> done. Verify:"
-echo "  curl -s http://127.0.0.1:8400/health"
+echo
+echo "Done. Verify:"
+echo "  curl -s http://127.0.0.1:8400/health   # router"
+echo "  curl -s http://127.0.0.1:8645/v1/models -H 'Authorization: Bearer x'  # portal proxy"

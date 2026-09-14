@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hermes.portal-proxy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/<user>/.hermes/hermes-agent/venv/bin/hermes</string>
+        <string>proxy</string>
+        <string>start</string>
+        <string>--provider</string>
+        <string>nous</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>8645</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/Users/<user>/.hermes/logs/portal-proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/<user>/.hermes/logs/portal-proxy.err.log</string>
+</dict>
+</plist>

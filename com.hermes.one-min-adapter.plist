@@ -7,7 +7,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/Users/<user>/.hermes/hermes-agent/venv/bin/python3</string>
-        <string>/Users/<user>/repos/one-min-adapter/one_min_adapter.py</string>
+        <string>/Users/<user>/repos/one-min-adapter/model_router.py</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -19,10 +19,12 @@
     <string>Background</string>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>ONEMIN_PORT</key>
+        <key>ROUTER_PORT</key>
         <string>8400</string>
         <key>ONEMIN_KEY_FILE</key>
         <string>/Users/<user>/.hermes/secrets/1min.key</string>
+        <key>PORTAL_PROXY_URL</key>
+        <string>http://127.0.0.1:8645/v1</string>
     </dict>
     <key>StandardOutPath</key>
     <string>/Users/<user>/.hermes/logs/one-min-adapter.log</string>
