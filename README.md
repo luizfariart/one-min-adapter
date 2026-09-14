@@ -96,6 +96,26 @@ chat" optimization.
 Short follow-ups (≤15 words) keep the previous assistant reply as context so
 "and in English?" still refers to something.
 
+## Tool calling & the `[[NEED_TOOL]]` handshake
+
+The router is tool-call transparent. It forwards the **full original request
+body** (tools, tool_choice, temperature, stream) to the Portal, so tasks that
+require an action can actually call functions.
+
+Two layers decide when a task needs a tool:
+
+1. **Vector index (pre-1min).** A deterministic TF-IDF + cosine index compares
+   the task against "action" and "text" centroids. Tasks closer to *action*
+   (web search, file/command/email/calendar, real-time data) skip the 1min
+   round-trip and go straight to the Portal.
+2. **`[[NEED_TOOL]]` handshake (in-1min).** The 1min.ai prompt tells the cheap
+   model to reply with exactly `[[NEED_TOOL]]` if the task requires an external
+   action it cannot do from text alone. The router detects the marker and
+   re-routes the original request to the Portal.
+
+Either way, a lightweight task that unexpectedly needs a tool is never left
+hanging.
+
 ## Thrash detection
 
 The router keeps a rolling history of the backend used per request. When the

@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-09-14
+
+### Fixed
+
+- **Tool-call deadlock.** The router was dropping `tools`/`tool_choice` when
+  forwarding to the Portal, so no task could ever call a function — the agent
+  would hang waiting for an action. Now the full request body is forwarded.
+
+### Added
+
+- **`[[NEED_TOOL]]` handshake** — the 1min.ai prompt asks the cheap model to
+  emit `[[NEED_TOOL]]` when the task needs an external action; the router then
+  re-routes the original request to the Portal.
+- **Vector index (TF-IDF + cosine)** — deterministic, dependency-free
+  "euclidean index" that classifies tasks as action vs text *before* the 1min
+  call, so tool-requiring tasks skip the cheap round-trip entirely.
+
 ## [1.2.0] - 2026-09-14
 
 ### Added

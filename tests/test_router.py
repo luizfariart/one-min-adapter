@@ -133,3 +133,65 @@ class TestThrashDetection:
         _mod._record_backend("portal")
         _mod._record_backend("1min")
         assert not _mod._detect_thrash()  # < 4 requests → not enough history
+
+
+class TestToolNeedDetection:
+    @pytest.mark.parametrize("text", [
+        "busque o preço do dólar hoje",
+        "leia esse arquivo",
+        "execute o comando de build",
+        "envie um email para o cliente",
+        "agende um lembrete amanhã",
+        "qual a cotação do bitcoin agora",
+        "mostre a previsão do tempo",
+        "salve essa nota no arquivo",
+        "me lembre de comprar leite",
+    ])
+    def test_action_tasks_detected(self, text):
+        assert _mod._needs_tool(text)
+
+    @pytest.mark.parametrize("text", [
+        "formate em tabela",
+        "traduza isso para inglês",
+        "explique o que é entropia",
+        "me dê 3 ideias de nome",
+        "resuma esse texto",
+        "corrija a ortografia",
+    ])
+    def test_text_tasks_not_action(self, text):
+        assert not _mod._needs_tool(text)
+
+    def test_empty_text_not_action(self):
+        assert not _mod._needs_tool("")
+
+
+class TestPortalPayload:
+    def test_preserves_tools_and_tool_choice(self):
+        body = {
+            "model": "ignored",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "web_search"}}],
+            "tool_choice": "auto",
+            "temperature": 0.7,
+            "stream": True,
+        }
+        out = _mod._portal_payload(body, "deepseek/deepseek-v4-pro")
+        assert out["model"] == "deepseek/deepseek-v4-pro"  # overridden
+        assert out["tools"] == body["tools"]                # preserved
+        assert out["tool_choice"] == "auto"                 # preserved
+        assert out["temperature"] == 0.7                    # preserved
+        assert out["stream"] is True                        # preserved
+
+    def test_does_not_mutate_original(self):
+        body = {"model": "x", "messages": [], "tools": []}
+        _mod._portal_payload(body, "y")
+        assert body["model"] == "x"  # original untouched
+
+
+class TestIsolatedPromptHasNeedToolHandshake:
+    def test_need_tool_instruction_present(self):
+        out = _mod._isolated_prompt([{"role": "user", "content": "formate em tabela"}])
+        assert _mod.NEED_TOOL in out
+
+    def test_need_tool_marker_constant(self):
+        assert _mod.NEED_TOOL == "[[NEED_TOOL]]"
